@@ -3,6 +3,7 @@ Master Agent - Natural language interface for the Octopus multi-agent system.
 """
 
 import json
+import re
 import logging
 from datetime import datetime
 from typing import Any
@@ -192,22 +193,47 @@ class MasterAgent(BaseAgent):
             if not available_agents:
                 return "Sorry, there are currently no available agents to handle your request. Please try again later."
 
-            # Use OpenAI to analyze the request and select the appropriate agent
+            # 1) Fast path: direct parse like "使用 agent.method ..."
+            direct = self._try_direct_agent_selection(request, available_agents)
+            if direct:
+                self.logger.info(
+                    f"🔵 [MASTER AGENT] Direct selection from user instruction: {direct}"
+                )
+                result = await self._execute_agent_method(direct)
+                self.logger.info("🟢 [MASTER AGENT] Agent execution completed successfully")
+                try:
+                    return self._format_result_natural_language(result, request)
+                except Exception:
+                    return json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, (dict, list)) else str(result)
+
+            # 2) Use LLM to analyze and select agent
             agent_selection = self._select_agent_for_request(request, available_agents)
 
             # Validate agent selection
             if not agent_selection or not agent_selection.get("agent_name"):
+                # 3) Heuristic fallback on timeout/uncertain selection
+                heuristic = self._heuristic_agent_selection(request, available_agents)
+                if heuristic:
+                    self.logger.info(
+                        f"🟡 [MASTER AGENT] Falling back to heuristic selection: {heuristic}"
+                    )
+                    result = await self._execute_agent_method(heuristic)
+                    self.logger.info("🟢 [MASTER AGENT] Agent execution completed successfully")
+                    try:
+                        return self._format_result_natural_language(result, request)
+                    except Exception:
+                        return json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, (dict, list)) else str(result)
+
                 # Provide a helpful response with available capabilities
                 agent_list = [
-                    f"- {agent['name']}: {agent['description']}"
-                    for agent in available_agents
+                    f"- {agent['name']}: {agent['description']}" for agent in available_agents
                 ]
-                return f"""Sorry, I cannot determine which agent to use to handle your request.
-
-Currently available agents:
-{chr(10).join(agent_list)}
-
-You can try to rephrase your request, or directly specify the function you want to use."""
+                return (
+                    "Sorry, I cannot determine which agent to use to handle your request.\n\n"
+                    + "Currently available agents:\n"
+                    + chr(10).join(agent_list)
+                    + "\n\nYou can try to rephrase your request, or directly specify the function you want to use."
+                )
 
             # Execute the selected agent method
             self.logger.info(
@@ -259,6 +285,8 @@ If no suitable agent is found, respond with:
         user_prompt = f"Request: {request}"
 
         try:
+            # Use a conservative token/temperature and short timeout for snappy selection
+            selection_max_tokens = min(self.max_tokens or 256, 256)
             response = self.client.chat.completions.create(
                 model=self.effective_model,
                 messages=[
@@ -273,8 +301,9 @@ If no suitable agent is found, respond with:
                     {"role": "user", "content": user_prompt},
                 ],
                 response_format={"type": "json_object"},
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
+                temperature=0.0,
+                max_tokens=selection_max_tokens,
+                timeout=10,  # seconds
             )
 
             response_text = response.choices[0].message.content
@@ -324,6 +353,102 @@ If no suitable agent is found, respond with:
         except Exception as e:
             self.logger.error(f"Error in agent selection: {e}")
             return None
+
+    def _extract_trailing_text(self, request: str) -> str | None:
+        """Extract the likely target text from a multi-line or colon-delimited request."""
+        if not request:
+            return None
+        # Prefer last non-empty line as payload
+        lines = [ln.strip() for ln in request.splitlines() if ln.strip()]
+        if len(lines) >= 2:
+            return lines[-1]
+        # Try colon-delimited content after full-width or half-width colon
+        if "：" in request:
+            return request.split("：", 1)[1].strip() or None
+        if ":" in request:
+            return request.split(":", 1)[1].strip() or None
+        return None
+
+    def _try_direct_agent_selection(
+        self, request: str, available_agents: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Parse direct instruction like '使用 agent.method ...' or 'use agent.method ...'."""
+        try:
+            m = re.search(r"(?:使用|use)\s+([a-zA-Z_][\w]*)\.([a-zA-Z_][\w]*)", request)
+            if not m:
+                # Also allow bare agent.method
+                m = re.search(r"\b([a-zA-Z_][\w]*)\.([a-zA-Z_][\w]*)\b", request)
+            if not m:
+                return None
+
+            agent_name, method_name = m.group(1), m.group(2)
+            # Validate against available agents
+            names = {a["name"] for a in available_agents}
+            if agent_name not in names:
+                return None
+
+            # Build parameters heuristically for common methods
+            params: dict[str, Any] = {}
+            if agent_name == "text_processor" and method_name == "analyze_sentiment":
+                text = self._extract_trailing_text(request) or request
+                params = {"text": text}
+
+            return {
+                "agent_name": agent_name,
+                "method_name": method_name,
+                "parameters": params,
+                "confidence": 1.0,
+                "reasoning": "Direct user instruction",
+            }
+        except Exception:
+            return None
+
+    def _heuristic_agent_selection(
+        self, request: str, available_agents: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Heuristic mapping when LLM selection fails (e.g., timeout).
+
+        Very conservative rules targeting built-in text_processor methods.
+        """
+        lower = request.lower()
+        has_text_processor = any(a["name"] == "text_processor" for a in available_agents)
+        if not has_text_processor:
+            return None
+
+        # Sentiment
+        if ("情感" in request) or ("sentiment" in lower):
+            text = self._extract_trailing_text(request) or request
+            return {
+                "agent_name": "text_processor",
+                "method_name": "analyze_sentiment",
+                "parameters": {"text": text},
+                "confidence": 0.7,
+                "reasoning": "Heuristic: sentiment keywords detected",
+            }
+
+        # Keywords
+        if ("关键词" in request) or ("keyword" in lower):
+            text = self._extract_trailing_text(request) or request
+            return {
+                "agent_name": "text_processor",
+                "method_name": "extract_keywords",
+                "parameters": {"text": text, "top_n": 10},
+                "confidence": 0.6,
+                "reasoning": "Heuristic: keyword extraction detected",
+            }
+
+        # Summary
+        if ("摘要" in request) or ("summary" in lower) or ("summarize" in lower):
+            text = self._extract_trailing_text(request) or request
+            return {
+                "agent_name": "text_processor",
+                "method_name": "summarize_text",
+                "parameters": {"text": text, "num_sentences": 3},
+                "confidence": 0.6,
+                "reasoning": "Heuristic: summary detected",
+            }
+
+        return None
 
     async def _execute_agent_method(self, agent_selection: dict[str, Any]) -> Any:
         """Execute the selected agent method."""
