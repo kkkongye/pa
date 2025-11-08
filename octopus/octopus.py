@@ -28,6 +28,7 @@ from .core.receiver.anp_receiver import (
 )
 from .master_agent import MasterAgent
 from .utils.log_base import get_logger, setup_enhanced_logging
+from .trust_provider.service import router as tp_router
 
 # Initialize enhanced logging
 setup_enhanced_logging()
@@ -229,6 +230,8 @@ app.include_router(chat_router, prefix="/v1", tags=["chat"])
 
 # Include agent description router (mounted at /agents)
 app.include_router(ad_router, tags=["agents"])
+# Include Trust Provider router
+app.include_router(tp_router, prefix="/v1/tp", tags=["tp"])
 
 # Also expose /ad.json at the root for convenience/tests
 @app.get("/ad.json")
