@@ -1,14 +1,20 @@
 """Minimal crypto helpers for TP skeleton.
 
-These are simple, clearly-marked stubs. Replace with proper crypto libs
-for production (Paillier, chameleon hash, IPFS helpers).
-Also contains deterministic signing helpers for basic consistency checks.
+These include simple stubs (Paillier, chameleon hash) for MVP wiring and
+real crypto utilities (RSA-OAEP and Ed25519 verify) for the secure request
+flow. Replace stubs with production-grade crypto as you iterate.
 """
 from dataclasses import dataclass
 from typing import Any, Dict
 import json
 import secrets
 import hashlib
+
+# Real crypto bits for the minimal encrypted flow
+import base64
+from threading import Lock
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa, ed25519
 
 
 @dataclass
@@ -68,4 +74,67 @@ def sign_with_secret(secret: str, data: Any) -> str:
 
 def verify_with_secret(secret: str, data: Any, signature: str) -> bool:
     return sign_with_secret(secret, data) == signature
+
+
+# =========================
+# RSA (TP side) for CR flow
+# =========================
+_RSA_CACHE: Dict[str, Any] = {}
+_RSA_LOCK = Lock()
+_RSA_PUBLIC_EXPONENT = 65537
+_RSA_KEY_SIZE = 2048
+
+
+def _generate_tp_rsa():
+    return rsa.generate_private_key(
+        public_exponent=_RSA_PUBLIC_EXPONENT, key_size=_RSA_KEY_SIZE
+    )
+
+
+def get_tp_rsa_private():
+    """Singleton in-memory RSA private key for TP (demo only)."""
+    if "rsa_priv" in _RSA_CACHE:
+        return _RSA_CACHE["rsa_priv"]
+    with _RSA_LOCK:
+        if "rsa_priv" not in _RSA_CACHE:
+            _RSA_CACHE["rsa_priv"] = _generate_tp_rsa()
+        return _RSA_CACHE["rsa_priv"]
+
+
+def get_tp_rsa_public_pem() -> str:
+    """Export TP RSA public key in PEM (SubjectPublicKeyInfo)."""
+    priv = get_tp_rsa_private()
+    pub = priv.public_key()
+    pem = pub.public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    return pem.decode()
+
+
+def rsa_decrypt_base64(b64_cipher: str) -> bytes:
+    """RSA-OAEP decrypt base64-encoded ciphertext with TP private key."""
+    ct = base64.b64decode(b64_cipher)
+    priv = get_tp_rsa_private()
+    pt = priv.decrypt(
+        ct,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    return pt
+
+
+# ======================================
+# Ed25519 verify for user signature check
+# ======================================
+def ed25519_verify(public_key_bytes: bytes, message: bytes, signature: bytes) -> bool:
+    """Verify Ed25519 signature; returns True/False."""
+    try:
+        pk = ed25519.Ed25519PublicKey.from_public_bytes(public_key_bytes)
+        pk.verify(signature, message)
+        return True
+    except Exception:
+        return False
 
